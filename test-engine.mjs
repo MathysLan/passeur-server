@@ -36,6 +36,53 @@ t('chaque situation a un contexte FR et EN',
   SITUATIONS.every((s) => s.ctx && s.ctx_en && s.detail && s.detail_en));
 t('identifiants de situation uniques',
   new Set(SITUATIONS.map((s) => s.id)).size === SITUATIONS.length);
+// --- la scène : ce que le client dessine ---------------------------------
+// Le client ne connaît aucune situation en particulier, il sait seulement
+// dessiner une scène. Une valeur non prévue ici sortirait donc un terrain muet
+// chez le joueur, sans la moindre erreur JS pour le signaler.
+//
+// Les règles de volley elles-mêmes (rotation, avant/arrière, ce qui est
+// autorisé) sont testées à part, dans test-rules.mjs.
+const RECEPTIONS = ['perfect', 'ok', 'short', 'deep', 'high', 'scramble'];
+const FROMS = ['left', 'center', 'right'];
+const FOCUS = ['spread', 'middle', 'left', 'right', 'setter'];
+const STATES = ['ready', 'running', 'free', 'marked', 'tired', 'hot', 'down'];
+
+t('chaque situation décrit sa scène',
+  SITUATIONS.every((s) => s.scene && s.scene.block && s.scene.options && s.scene.lineup));
+t('réception et service sont des valeurs connues',
+  SITUATIONS.every((s) => RECEPTIONS.includes(s.scene.reception.quality)
+    && FROMS.includes(s.scene.serve)));
+t('le bloc est décrit par un nombre de contreurs, un départ, une cible et un retard',
+  SITUATIONS.every((s) => s.scene.block.count >= 0 && s.scene.block.count <= 3
+    && FOCUS.includes(s.scene.block.start) && FOCUS.includes(s.scene.block.target)
+    && typeof s.scene.block.late === 'boolean'));
+t('chaque option porte un état d attaquant connu',
+  SITUATIONS.every((s) => ['gauche', 'courte', 'droite', 'arriere']
+    .every((k) => STATES.includes(s.scene.options[k].state))));
+
+// LA règle de ce champ : il décrit le terrain, il ne souffle pas la réponse.
+// `why` y existe, mais uniquement pour expliquer un REFUS de règle (« passeur
+// arrière »), jamais pour commenter la qualité d'un choix — on le vérifie.
+t('LA SCÈNE NE CONTIENT AUCUNE TRACE DU BARÈME',
+  SITUATIONS.every((s) => {
+    const sansRefus = JSON.stringify(s.scene).replace(/"why":"[^"]*"/g, '""');
+    if (/score|best|points|relevance/i.test(sansRefus)) return false;
+    // On compare des NOMBRES, pas des sous-chaînes : la scène contient
+    // maintenant des chiffres parfaitement légitimes (numéro de position,
+    // durée de la mise en situation), et « 2600 » contient « 0 ».
+    const dans = new Set((sansRefus.match(/-?\d+(?:\.\d+)?/g) || []));
+    return !PASSES.some((p) => s.scores[p.id] >= 10 && dans.has(String(s.scores[p.id])));
+  }));
+t('les seuls `why` de la scène sont des refus de règle, pas des conseils',
+  SITUATIONS.every((s) => Object.values(s.scene.options)
+    .every((o) => !o.why || /\d+\.\d+/.test(o.why))));
+// Et elle doit rester cohérente avec la prose, sinon le terrain raconte une
+// histoire et le texte une autre.
+t('un attaquant « à terre » n est jamais le meilleur choix',
+  SITUATIONS.every((s) => ['gauche', 'courte', 'droite', 'arriere']
+    .every((k) => s.scene.options[k].state !== 'down' || E.bestOf(s) !== k)));
+
 // Sans mauvais choix, il n'y a pas de décision à prendre.
 t('chaque situation a un choix clairement meilleur et un clairement mauvais',
   SITUATIONS.every((s) => {

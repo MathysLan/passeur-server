@@ -13,7 +13,14 @@
 //   3. Les points sont calculés par engine.js, ici, et poussés aux clients.
 //
 // Progression pilotée par le MJ (l'hôte), comme les versions récentes des
-// autres jeux : pas de timer de gameplay côté client.
+// autres jeux. Deux exceptions, et elles sont dans CE fichier, pas côté
+// client : la durée de la mise en situation et les cinq secondes de décision.
+// C'est le serveur qui décide quand on regarde et quand on joue, pour que deux
+// joueurs aient exactement la même fenêtre.
+//
+// Les règles du volley, elles, vivent dans rules.js : positions, ligne avant /
+// ligne arrière, ce qu'un joueur arrière a le droit de faire. Le client n'en
+// connaît aucune — il reçoit une scène déjà résolue et la dessine.
 const http = require('node:http');
 const { WebSocketServer } = require('ws');
 const { SITUATIONS, PASSES } = require('./situations.js');
@@ -41,6 +48,8 @@ function publicPlayers(room) {
   return room.players.map((p) => ({
     id: p.id, name: p.name, avatar: p.avatar, score: p.score, host: p.id === room.hostId,
     answered: room.phase === 'play' ? !!p.answer : undefined,
+    // Pendant la mise en situation, personne n'a encore le droit de répondre :
+    // on n'affiche donc aucun état « a répondu / n'a pas répondu ».
   }));
 }
 
@@ -57,24 +66,56 @@ function startGame(room, rounds) {
   nextRound(room);
 }
 
+// Une manche se joue en DEUX temps, et c'est le serveur qui tient les deux.
+//
+//   1. `round`  — la mise en situation. Le client rejoue le service, la
+//                 réception, le déplacement du passeur et la réaction du bloc.
+//                 Aucun chrono ne tourne : on regarde, on comprend, on lit le
+//                 texte si on veut.
+//   2. `go`     — « À TOI ». C'est SEULEMENT à partir de ce message que les
+//                 cinq secondes courent et que les zones deviennent actives.
+//
+// Pourquoi le serveur et pas le client : parce que deux joueurs doivent avoir
+// exactement le même temps de décision. Si chacun démarrait son chrono à la fin
+// de sa propre animation, celui dont l'onglet a ramé jouerait plus longtemps.
 function nextRound(room) {
   room.roundIndex += 1;
   if (room.roundIndex >= room.deck.length) return endGame(room);
   const s = room.deck[room.roundIndex];
-  room.phase = 'play';
-  room.sentAt = Date.now();
+  room.phase = 'intro';
+  room.sentAt = 0;
   room.players.forEach((p) => { p.answer = null; });
 
+  const introMs = Math.max(800, Math.min(4000, (s.scene && s.scene.introMs) || 2400));
+
   // Ce que le client a le droit de voir. Pas `scores`, pas `why`, pas `best`.
+  // `scene` en fait partie : c'est le modèle de volley (rotation, réception,
+  // bloc, propriétaires et légalité des options), soit exactement ce qu'un
+  // joueur lit sur le terrain. Elle ne contient AUCUNE indication du bon
+  // choix — le test le vérifie, parce que c'est typiquement le champ dans
+  // lequel un barème finit par se glisser « juste pour l'affichage ».
   broadcast(room, {
     type: 'round',
     index: room.roundIndex,
     of: room.deck.length,
     ctx: s.ctx, ctx_en: s.ctx_en,
     detail: s.detail, detail_en: s.detail_en,
+    scene: s.scene || null,
+    introMs,
     msLimit: MS_LIMIT,
     players: publicPlayers(room),
   });
+
+  clearTimeout(room.timer);
+  room.timer = setTimeout(() => startDecision(room), introMs);
+}
+
+// « À TOI ». Le chrono part d'ici, pour tout le monde en même temps.
+function startDecision(room) {
+  if (room.phase !== 'intro') return;
+  room.phase = 'play';
+  room.sentAt = Date.now();
+  broadcast(room, { type: 'go', msLimit: MS_LIMIT, players: publicPlayers(room) });
 
   // Filet anti-blocage : si un joueur ne répond jamais, la manche se résout
   // quand même. Le serveur ne dépend jamais d'un client pour avancer.
@@ -100,6 +141,11 @@ function resolveRound(room) {
       id: p.id, name: p.name, avatar: p.avatar,
       passId: a ? a.passId : null,
       points: r.points, relevance: r.relevance, timedOut: r.timedOut,
+      // Le détail du calcul, pour que l'écran de résultats puisse expliquer
+      // « pertinence 100, vitesse 92 % → 92 points » au lieu d'un nombre sorti
+      // de nulle part. Ce sont les chiffres du joueur lui-même, mesurés à
+      // l'horloge serveur ; rien sur les AUTRES passes n'est révélé ici.
+      speed: r.speed, ms: elapsed,
       wasBest: a ? a.passId === best : false,
       why: a ? s.why[a.passId] : null,
       why_en: a ? s.why_en[a.passId] : null,
@@ -177,14 +223,23 @@ wss.on('connection', (ws) => {
       // Le MJ peut relancer depuis le salon, l'écran de résultats ou la fin
       // (« rejouer »). Le seul moment interdit est pendant une manche : on ne
       // coupe pas la parole à des joueurs en train de décider.
-      if (room.phase === 'play') return fail('manche en cours');
+      if (room.phase === 'play' || room.phase === 'intro') return fail('manche en cours');
       return startGame(room, msg.rounds);
     }
 
     if (msg.action === 'answer') {
+      // Pendant la mise en situation, on regarde — on ne joue pas. Un client
+      // qui enverrait sa réponse avant le « go » se verrait accorder un temps
+      // de décision négatif : on refuse, et on le dit.
+      if (room.phase === 'intro') return fail("la situation n'est pas finie de se mettre en place");
       if (room.phase !== 'play') return;                 // hors phase : on ignore
       if (me.answer) return;                             // une seule réponse
       if (!PASSES.some((p) => p.id === msg.passId)) return fail('passe inconnue');
+      // Une option que les règles interdisent n'est pas jouable. C'est le cas
+      // de la deuxième main quand le passeur est arrière (FIVB 13.2.2) : le
+      // client la grise déjà, le serveur la refuse pour de bon.
+      const opt = (room.deck[room.roundIndex].scene.options || {})[msg.passId];
+      if (opt && opt.legal === false) return fail(opt.why || 'cette option est interdite par les règles');
       // On note l'INSTANT SERVEUR, pas le chrono annoncé par le client.
       me.answer = { passId: msg.passId, at: Date.now() };
       broadcast(room, { type: 'answered', players: publicPlayers(room) });

@@ -78,6 +78,55 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     && !JSON.stringify(r1).includes('Meilleur'));
   t('la limite de temps est annoncée', r1.msLimit === 5000);
 
+  // La scène : le modèle de volley que le client va dessiner. Elle part AVEC la
+  // manche, donc c'est exactement le message dans lequel un barème pourrait se
+  // glisser sans qu'on le remarque — l'écran, lui, aurait l'air normal.
+  t('la manche décrit le terrain (scène)',
+    !!r1.scene && !!r1.scene.block && !!r1.scene.options && Array.isArray(r1.scene.lineup)
+    && typeof r1.scene.reception.quality === 'string');
+  t("LA SCÈNE ENVOYÉE NE CONTIENT NI NOTE NI CONSEIL",
+    !/score|best|relevance|points/i.test(JSON.stringify(r1.scene).replace(/"why":"[^"]*"/g, '""')));
+  t('la scène dit qui joue chaque option, et si les règles l autorisent',
+    ['gauche', 'courte', 'deuxieme', 'droite', 'arriere']
+      .every((k) => r1.scene.options[k] && r1.scene.options[k].by
+        && typeof r1.scene.options[k].legal === 'boolean'));
+  t('la scène donne la composition au service : six joueurs',
+    r1.scene.lineup.length === 6 && new Set(r1.scene.lineup).size === 6);
+
+  // --- LES DEUX TEMPS D'UNE MANCHE ---------------------------------------
+  // On regarde d'abord, on joue ensuite. C'est le serveur qui ouvre la fenêtre
+  // de décision, pour que deux joueurs aient exactement la même.
+  t('la mise en situation a une durée annoncée',
+    r1.introMs >= 800 && r1.introMs <= 4000);
+  t('la limite de décision est annoncée', r1.msLimit === 5000);
+
+  mj.clear(); j2.clear();
+  mj.send({ action: 'answer', passId: 'gauche' });
+  const tooSoon = await mj.wait('error');
+  t('ON NE PEUT PAS RÉPONDRE PENDANT LA MISE EN SITUATION',
+    /pas finie de se mettre en place/.test(tooSoon.message));
+
+  const t0 = Date.now();
+  const go = await mj.wait('go', 6000);
+  const waited = Date.now() - t0;
+  t('le « à toi » arrive après la mise en situation, pas avant',
+    waited >= r1.introMs * 0.5);
+  t('le « à toi » rouvre la limite de temps', go.msLimit === 5000);
+  const go2 = await j2.wait('go', 6000);
+  t('les DEUX joueurs reçoivent le même départ', !!go2 && go2.msLimit === go.msLimit);
+
+  // Une option que les règles interdisent est refusée pour de bon.
+  const illegal = Object.keys(r1.scene.options).find((k) => !r1.scene.options[k].legal);
+  if (illegal) {
+    j2.clear();
+    j2.send({ action: 'answer', passId: illegal });
+    const errLegal = await j2.wait('error');
+    t('UNE OPTION INTERDITE PAR LES RÈGLES EST REFUSÉE (' + illegal + ')',
+      /13\.2\.2|interdite/.test(errLegal.message));
+  } else {
+    t('cette manche n a aucune option interdite (rotation passeur avant)', true);
+  }
+
   // Réponse rapide du MJ, puis du second joueur.
   mj.clear(); j2.clear();
   mj.send({ action: 'answer', passId: 'courte' });
@@ -99,6 +148,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   t('les résultats arrivent quand tout le monde a répondu', res.results.length === 2);
   t('les résultats donnent enfin le meilleur choix et pourquoi', !!res.best && !!res.bestWhy);
   t('chaque joueur a des points et son total', res.results.every((r) => typeof r.points === 'number' && typeof r.score === 'number'));
+  // De quoi expliquer le score au lieu de l'annoncer : pertinence, vitesse,
+  // et le temps réellement mesuré par le serveur.
+  t('chaque joueur reçoit le détail de son calcul (pertinence, vitesse, temps)',
+    res.results.every((r) => typeof r.relevance === 'number'
+      && typeof r.speed === 'number' && r.speed >= 50 && r.speed <= 100
+      && typeof r.ms === 'number' && r.ms >= 0));
+  t('le détail ne parle que de la passe jouée, pas des quatre autres',
+    res.results.every((r) => Object.keys(r).filter((k) => /^(why|relevance)$/.test(k)).length <= 2)
+    && !JSON.stringify(res.results).includes('"scores"'));
   t('la double réponse a été ignorée',
     res.results.find((r) => r.name === 'Mathys').passId === 'courte');
 
@@ -112,8 +170,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   t('manche suivante', r2.index === 1);
 
   // --- le filet anti-blocage : personne ne répond
+  // La manche dure maintenant mise en situation + 5 s + tolérance réseau.
   mj.clear(); j2.clear();
-  const late = await mj.wait('results', 9000);
+  const late = await mj.wait('results', 13000);
   t('une manche se résout même si personne ne répond', late.results.every((r) => r.timedOut === true));
   t('ne pas répondre ne rapporte rien', late.results.every((r) => r.points === 0));
 
@@ -121,6 +180,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   mj.clear();
   mj.send({ action: 'next' });
   await mj.wait('round');
+  await mj.wait('go', 6000);               // on attend la fin de la mise en situation
+  await j2.wait('go', 6000);
   mj.send({ action: 'answer', passId: 'droite' });
   j2.send({ action: 'answer', passId: 'arriere' });
   const res3 = await mj.wait('results');
@@ -137,6 +198,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   mj.clear(); j2.clear();
   mj.send({ action: 'start', rounds: 1 });
   await mj.wait('round');
+  // On attend le « à toi » AVANT de traîner : c'est de là que part le chrono,
+  // et c'est précisément ce que ce test doit prouver.
+  await mj.wait('go', 6000);
+  await j2.wait('go', 6000);
   await sleep(2600);                       // on traîne volontairement
   mj.clear();
   mj.send({ action: 'answer', passId: 'courte' });
@@ -150,10 +215,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   mj.clear();
   mj.send({ action: 'start', rounds: 2 });
   await mj.wait('round');
+  await mj.wait('go', 6000);
   mj.clear();
   j2.ws.close();
   mj.send({ action: 'answer', passId: 'gauche' });
-  const alone = await mj.wait('results', 9000);
+  const alone = await mj.wait('results', 13000);
   t('un joueur qui quitte ne bloque pas la manche', alone.results.length === 1);
 
   mj.ws.close();
