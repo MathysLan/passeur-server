@@ -26,6 +26,7 @@ const { WebSocketServer } = require('ws');
 const { SITUATIONS, PASSES } = require('./situations.js');
 const E = require('./engine.js');
 const { cleanAvatar } = require('./avatar.js');
+const presenceJoueurs = require('./presence.js');
 
 const PORT = process.env.PORT || 8090;
 const MS_LIMIT = 5000;          // temps de décision, en ms
@@ -185,6 +186,9 @@ const server = http.createServer((req, res) => {
   res.end('passeur-server ok\n');
 });
 const wss = new WebSocketServer({ server });
+// Présence applicative : un onglet gelé ne reste pas compté dans sa room (voir
+// presence.js). Le module ne fait que fermer le socket ; le départ habituel fait le reste.
+const presence = presenceJoueurs.attach(wss);
 
 wss.on('connection', (ws) => {
   let room = null, me = null;
@@ -194,6 +198,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return fail('message illisible'); }
+    if (presence.consume(ws, msg)) return;   // { action: 'presence' } : jamais « pas encore dans une partie »
 
     if (msg.action === 'join') {
       const name = String(msg.name || '').trim().slice(0, 16) || 'Joueur';
